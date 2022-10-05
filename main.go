@@ -4,7 +4,6 @@ import "C"
 import (
 	"db_test/mysql"
 	"db_test/redis"
-	"encoding/json"
 	"fmt"
 	"gorm.io/gorm"
 	"math"
@@ -16,10 +15,10 @@ func main() {
 	defer mysql.Close()
 	// 获取用户数据
 
-	total, list, except := FindPopularSpace(1, 10, []string{"0xe183ea3871685f340ffdb8b784a20d3c9d3511be"}, nil)
+	total, list, except := FindPopularSpace(1, 40, []string{"0xe183ea3871685f340ffdb8b784a20d3c9d3511be"}, nil)
 
-	buf, _ := json.Marshal(list)
-	fmt.Println("+++++++++++++++", total, string(buf), len(except))
+	//buf, _ := json.Marshal(list)
+	fmt.Println("+++++++++++++++", total, len(list), len(except))
 
 }
 
@@ -28,11 +27,6 @@ const (
 	SpaceUserRank    = "space_user_rank"
 )
 
-// FindPopularSpace
-// （1）置顶 space；
-// （2）【在线人数】：前 5 个 Space 按照在线人数来排序；
-// （3）【艺术馆】：按艺术馆 NFT 挂载数量，从前 10 名中随机 5 个；
-// （4）【个人馆】：随机 25 个馆
 func FindPopularSpace(page, limit int, artContracts []string, exceptSpaceIds []int64) (int64, []SpaceBase, []int64) {
 	if len(artContracts) == 0 {
 		return 0, nil, nil
@@ -53,19 +47,21 @@ func FindPopularSpace(page, limit int, artContracts []string, exceptSpaceIds []i
 		Where("a.china_word=?", 0).
 		Where("a.id >= ?", MaxSystemSpaceId)
 
-	//ret.Count(&totalCount)
-
 	// 1.置顶数据
 	var toppingCount int64
-	ret.Where("a.topping>?", 0).
-		Count(&toppingCount) // 置顶的条数
+	ret0 := ret.Session(&gorm.Session{})
+	ret0 = ret0.Where("a.topping>?", 0)
+	ret0.Count(&toppingCount) // 置顶的条数
 
 	totalCount = toppingCount + 5 + 5 + 25
 
+	var _totalCount int64
+	ret.Count(&_totalCount)
+	totalCount = int64(math.Min(float64(_totalCount), float64(totalCount)))
+
 	// 置顶里面还有数据
 	if int64((page-1)*limit) < toppingCount {
-		ret.Where("a.topping>?", 0).
-			Order("a.topping asc").
+		ret0.Order("a.topping asc").
 			Offset((page - 1) * limit).
 			Limit(limit).
 			Scan(&raws)
@@ -73,6 +69,7 @@ func FindPopularSpace(page, limit int, artContracts []string, exceptSpaceIds []i
 
 	// topping 阶段取的数据已经足够；或者所有的数据已经取完了
 	curToppingNum := len(raws)
+
 	if curToppingNum == limit || (curToppingNum+(page-1)*limit) >= int(totalCount) {
 		return totalCount, raws, exceptSpaceIds
 	}
@@ -131,11 +128,11 @@ func FindPopularSpace(page, limit int, artContracts []string, exceptSpaceIds []i
 			ret1 := ret.Session(&gorm.Session{})
 			if len(includeSpaceIds) > 0 {
 				ret1 = ret1.Where("a.id in (?)", includeSpaceIds)
+				if len(exceptSpaceIds) > 0 {
+					ret1 = ret1.Where("a.id not in(?)", exceptSpaceIds)
+				}
+				ret1.Scan(&rRaws)
 			}
-			if len(exceptSpaceIds) > 0 {
-				ret1 = ret1.Where("a.id not in(?)", exceptSpaceIds)
-			}
-			ret1.Scan(&rRaws)
 
 			// redis 里面只有房间有人的才有数据
 			if n := needNum - len(rRaws); n > 0 {
@@ -252,12 +249,15 @@ func FindPopularSpace(page, limit int, artContracts []string, exceptSpaceIds []i
 		stage4Raws []SpaceBase
 	)
 	if len(exceptSpaceIds) > 0 {
-		ret = ret.Where("id not in(?)", exceptSpaceIds)
+		ret = ret.Where("a.id not in(?)", exceptSpaceIds)
 	}
+
+	needNum := int(math.Min(float64(sStage4Num), float64(nLimit)))
+
 	ret.Where("a.contract not in (?)", artContracts).
 		Order("rand()").
 		Offset(nOffset).
-		Limit(sStage4Num).
+		Limit(needNum).
 		Scan(&stage4Raws)
 
 	raws = append(raws, stage4Raws...)
@@ -266,6 +266,12 @@ func FindPopularSpace(page, limit int, artContracts []string, exceptSpaceIds []i
 	}
 	return totalCount, raws, exceptSpaceIds
 }
+
+// FindPopularSpace
+// （1）置顶 space；
+// （2）【在线人数】：前 5 个 Space 按照在线人数来排序；
+// （3）【艺术馆】：按艺术馆 NFT 挂载数量，从前 10 名中随机 5 个；
+// （4）【个人馆】：随机 25 个馆
 
 type SpaceBase struct {
 	Space
@@ -318,4 +324,39 @@ type SpaceEnterUserModle struct {
 	UserId     int64  `json:"user_id"`
 	HeadImg    string `json:"head_img"`
 	HeadImgNFT string `json:"head_img_nft"`
+}
+
+func FindFilterSpaceList(page, limit int, ownerUserId int64, searchKey string) (int64, []SpaceBase) {
+	var (
+		total int64
+		raws  []SpaceBase
+	)
+	ret := mysql.DB().
+		Model(&Space{}).
+		Joins("as a left join users as b on a.user_id = b.id").
+		Select("a.*,b.head_img as creator_image,length(b.head_img_nft)>0 as creator_nft_image,b.user_name as creator_name").
+		Where("a.id >= ?", MaxSystemSpaceId)
+
+	if ownerUserId > 0 {
+		ret = ret.Where("a.user_id=?", ownerUserId).Where("a.status in (?)", []int{1, 3})
+
+		ret.Count(&total)
+
+		ret.Order("a.create_time desc").
+			Offset((page - 1) * limit).
+			Limit(limit).
+			Scan(&raws)
+		return total, raws
+	} else {
+		ret = ret.Where("a.status=?", 1)
+		if len(searchKey) > 0 {
+			ret = ret.Where(`a.name like ? or a.id =?`, fmt.Sprintf("%s%s%s", "%", searchKey, "%"), searchKey)
+		}
+		ret.Count(&total)
+
+		ret.Offset((page - 1) * limit).
+			Limit(limit).
+			Scan(&raws)
+		return total, raws
+	}
 }
